@@ -1,0 +1,1413 @@
+Here is an example of notebook of one of the participants that scored very well. Please summarise the results and help me understand how he tacled the problem:
+
+NOTEBOOK
+
+
+!pip install /kaggle/input/rdkit-2025-3-3-cp311/rdkit-2025.3.3-cp311-cp311-manylinux_2_28_x86_64.whl
+!pip install mordred --no-index --find-links=file:///kaggle/input/mordred-1-2-0-py3-none-any/
+
+!cp -r /kaggle/input/autogluon-package/* /kaggle/working/
+!pip install -f --quiet --no-index --find-links='/kaggle/input/autogluon-package' 'autogluon.tabular-1.3.1-py3-none-any.whl'
+
+!cp -r /kaggle/input/scikit-package/* /kaggle/working/
+!pip install -f --quiet --no-index --find-links='/kaggle/input/scikit-package' 'scikit_learn-1.5.2-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl' 
+
+!rm -r /kaggle/working/*
+
+from autogluon.tabular import TabularDataset, TabularPredictor
+
+# =============================================================================
+# DATA LOADING AND AUGMENTATION FUNCTIONS
+# =============================================================================
+
+
+
+def make_smile_canonical(smile):
+    """Convert SMILES to canonical form to avoid duplicates"""
+    try:
+        mol = Chem.MolFromSmiles(smile)
+        if mol is None:
+            return np.nan
+        canon_smile = Chem.MolToSmiles(mol, canonical=True)
+        return canon_smile
+    except:
+        return np.nan
+
+def add_extra_data(df_train, df_extra, target):
+    """Add external data for target augmentation"""
+    n_samples_before = len(df_train[df_train[target].notnull()])
+    
+    # Make copies to avoid modifying original dataframes
+    df_train = df_train.copy()
+    df_extra = df_extra.copy()
+    
+    df_extra['SMILES'] = df_extra['SMILES'].apply(lambda s: make_smile_canonical(s))
+    df_extra = df_extra.groupby('SMILES', as_index=False)[target].mean()
+    
+    cross_smiles = set(df_extra['SMILES']) & set(df_train['SMILES'])
+    unique_smiles_extra = set(df_extra['SMILES']) - set(df_train['SMILES'])
+
+    # Prioritize target values from competition data
+    for smile in df_train[df_train[target].notnull()]['SMILES'].tolist():
+        if smile in cross_smiles:
+            cross_smiles.remove(smile)
+
+    # Impute missing values for competition SMILES
+    for smile in cross_smiles:
+        df_train.loc[df_train['SMILES']==smile, target] = df_extra[df_extra['SMILES']==smile][target].values[0]
+    
+    # Add new SMILES from external data
+    new_data = df_extra[df_extra['SMILES'].isin(unique_smiles_extra)]
+    df_train = pd.concat([df_train, new_data], axis=0, ignore_index=True)
+
+    n_samples_after = len(df_train[df_train[target].notnull()])
+    print(f'  {target}: Added {n_samples_after-n_samples_before} new samples')
+    return df_train
+
+def load_and_augment_train_data(cfg):
+    """Load training data and augment with external datasets"""
+    print("📂 Loading and augmenting training data...")
+    
+    # Load base training data
+    train = pd.read_csv(cfg.PATH + 'train.csv')
+    train['SMILES'] = train['SMILES'].apply(lambda s: make_smile_canonical(s))
+    
+    # Load external datasets
+    print("📂 Loading external datasets...")
+    
+    try:
+        # Tc data
+        data_tc = pd.read_csv('/kaggle/input/tc-smiles/Tc_SMILES.csv')
+        data_tc = data_tc.rename(columns={'TC_mean': 'Tc'})
+        train = add_extra_data(train, data_tc, 'Tc')
+    except Exception as e:
+        print(f"⚠️ Could not load Tc data: {e}")
+    
+    try:
+        # Tg data sources
+        data_tg2 = pd.read_csv('/kaggle/input/smiles-extra-data/JCIM_sup_bigsmiles.csv', usecols=['SMILES', 'Tg (C)'])
+        data_tg2 = data_tg2.rename(columns={'Tg (C)': 'Tg'})
+        train = add_extra_data(train, data_tg2, 'Tg')
+    except Exception as e:
+        print(f"⚠️ Could not load Tg data 2: {e}")
+    
+    try:
+        data_tg3 = pd.read_excel('/kaggle/input/smiles-extra-data/data_tg3.xlsx')
+        data_tg3 = data_tg3.rename(columns={'Tg [K]': 'Tg'})
+        data_tg3['Tg'] = data_tg3['Tg'] - 273.15
+        train = add_extra_data(train, data_tg3, 'Tg')
+    except Exception as e:
+        print(f"⚠️ Could not load Tg data 3: {e}")
+    
+    try:
+        # Density data
+        data_dnst = pd.read_excel('/kaggle/input/smiles-extra-data/data_dnst1.xlsx')
+        data_dnst = data_dnst.rename(columns={'density(g/cm3)': 'Density'})[['SMILES', 'Density']]
+        data_dnst['SMILES'] = data_dnst['SMILES'].apply(lambda s: make_smile_canonical(s))
+        data_dnst = data_dnst[(data_dnst['SMILES'].notnull())&(data_dnst['Density'].notnull())&(data_dnst['Density'] != 'nylon')]
+        data_dnst['Density'] = data_dnst['Density'].astype('float64')
+        data_dnst['Density'] -= 0.118
+        train = add_extra_data(train, data_dnst, 'Density')
+    except Exception as e:
+        print(f"⚠️ Could not load density data: {e}")
+    
+    print(f"📊 Final training sample counts:")
+    for t in cfg.TARGETS:
+        print(f'  {t}: {len(train[train[t].notnull()])} samples')
+    
+    return train
+
+def load_test_data(cfg):
+    """Load test data"""
+    print("📂 Loading test data...")
+    test = pd.read_csv(cfg.PATH + 'test.csv')
+    test['SMILES'] = test['SMILES'].apply(lambda s: make_smile_canonical(s))
+    return test
+
+# =============================================================================
+# MOLECULAR FEATURE COMPUTATION
+# =============================================================================
+
+
+
+'''
+features['max_degree'] = max([d for n, d in G.degree()]) if n_nodes > 0 else 0
+
+if nx.is_connected(G):
+    closeness = list(nx.closeness_centrality(G).values())
+    features['closeness_mean'] = np.mean(closeness)
+else:
+    features['closeness_mean'] = 0
+
+try:
+    katz = list(nx.katz_centrality(G, max_iter=1000).values())
+    features['katz_centrality_std'] = np.std(katz)
+except:
+    features['katz_centrality_std'] = 0
+
+
+def compute_atom_graph_features(G, mol):
+    """Atom-specific graph features"""
+    features = {}
+    
+    try:
+        # Atom type distribution in graph context
+        atom_types = [atom.GetSymbol() for atom in mol.GetAtoms()]
+        atom_counts = Counter(atom_types)
+        
+
+        
+        # Heteroatom ratio
+        total_atoms = len(atom_types)
+        hetero_atoms = total_atoms - atom_counts.get('C', 0)
+        features['heteroatom_ratio'] = hetero_atoms / total_atoms if total_atoms > 0 else 0
+        
+        
+    except Exception:
+        features['heteroatom_ratio'] = 0
+'''
+
+'''
+AtomPair_B512_Bit0138
+AtomPair_B512_Bit0448
+AtomPair_B512_Bit0408 
+
+fingerprints = []
+legends = [f"AtomPair_B{n_bits}_Bit{str(n).zfill(4)}" for n in range(n_bits)]
+
+print(f"🧬 Computing atom pair fingerprints ({n_bits} bits) for {len(smiles_list)} molecules...")
+
+for i, smiles in enumerate(tqdm(smiles_list, desc="Computing fingerprints")):
+    mol = Chem.MolFromSmiles(smiles)
+    if not mol:
+        # Handle invalid molecules
+        fingerprint = [0] * n_bits
+    else:
+        # Generate atom pair fingerprint
+        fp = rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=n_bits)
+        fingerprint = [int(x) for x in fp.ToBitString()]
+    
+    fingerprints.append(np.array(fingerprint))
+
+'''
+
+# =============================================================================
+# MOLECULAR FEATURE COMPUTATION
+# =============================================================================
+
+
+
+def compute_molecular_features_for_smiles(smiles, useless_cols):
+    """Compute all molecular features for a single SMILES"""
+    try:
+        # Initialize results dictionary
+        results = {}
+        
+        # Compute RDKit descriptors
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            desc_names = [desc[0] for desc in Descriptors.descList if desc[0] not in useless_cols]
+            results.update({name: None for name in desc_names})
+        else:
+            desc_results = [desc[1](mol) for desc in Descriptors.descList if desc[0] not in useless_cols]
+            desc_names = [desc[0] for desc in Descriptors.descList if desc[0] not in useless_cols]
+            results.update(dict(zip(desc_names, desc_results)))
+        
+        # Compute graph features
+        graph_defaults = {
+            'graph_diameter': 0, 'avg_shortest_path': 0, 'num_cycles': 0,
+            'betweenness_mean': 0, 'betweenness_std': 0, 'eigenvector_mean': 0, 
+            'ring_4': 0, 'max_degree': 0, 'closeness_mean': 0, 'katz_centrality_std': 0,
+            'heteroatom_ratio': 0
+        }
+        
+        if mol is not None:
+            try:
+                adj = rdmolops.GetAdjacencyMatrix(mol)
+                G = nx.from_numpy_array(adj)
+                
+                # Graph diameter and shortest path
+                if nx.is_connected(G):
+                    results['graph_diameter'] = nx.diameter(G)
+                    results['avg_shortest_path'] = nx.average_shortest_path_length(G)
+                else:
+                    results['graph_diameter'] = 0
+                    results['avg_shortest_path'] = 0
+                
+                # Maximum degree
+                n_nodes = G.number_of_nodes()
+                results['max_degree'] = max([d for n, d in G.degree()]) if n_nodes > 0 else 0
+                
+                # Closeness centrality
+                if nx.is_connected(G):
+                    closeness = list(nx.closeness_centrality(G).values())
+                    results['closeness_mean'] = np.mean(closeness) if closeness else 0
+                else:
+                    results['closeness_mean'] = 0
+                
+                # Katz centrality
+                try:
+                    katz = list(nx.katz_centrality(G, max_iter=1000).values())
+                    results['katz_centrality_std'] = np.std(katz) if len(katz) > 1 else 0
+                except:
+                    results['katz_centrality_std'] = 0
+                
+                # Number of cycles
+                cycles = list(nx.cycle_basis(G))
+                results['num_cycles'] = len(cycles)
+                
+                # Centrality measures
+                betweenness = list(nx.betweenness_centrality(G).values())
+                if betweenness:
+                    betweenness = [b for b in betweenness if np.isfinite(b)]
+                    results['betweenness_mean'] = np.mean(betweenness) if betweenness else 0
+                    results['betweenness_std'] = np.std(betweenness) if len(betweenness) > 1 else 0
+                else:
+                    results['betweenness_mean'] = 0
+                    results['betweenness_std'] = 0
+                
+                # Eigenvector centrality
+                try:
+                    eigenvector = list(nx.eigenvector_centrality(G, max_iter=1000, tol=1e-6).values())
+                    eigenvector = [e for e in eigenvector if np.isfinite(e)]
+                    results['eigenvector_mean'] = np.mean(eigenvector) if eigenvector else 0
+                except:
+                    results['eigenvector_mean'] = 0
+                
+                # Ring analysis
+                cycle_lengths = [len(cycle) for cycle in cycles]
+                results['ring_4'] = sum(1 for length in cycle_lengths if length == 4)
+                
+                # Atom-specific features
+                try:
+                    # Atom type distribution
+                    atom_types = [atom.GetSymbol() for atom in mol.GetAtoms()]
+                    atom_counts = Counter(atom_types)
+                    
+                    # Heteroatom ratio
+                    total_atoms = len(atom_types)
+                    hetero_atoms = total_atoms - atom_counts.get('C', 0)
+                    results['heteroatom_ratio'] = hetero_atoms / total_atoms if total_atoms > 0 else 0
+                except Exception:
+                    results['heteroatom_ratio'] = 0
+                
+            except Exception as e:
+                results.update(graph_defaults)
+        else:
+            results.update(graph_defaults)
+        
+        # Compute Mordred features (key ones from research)
+        mordred_defaults = {'AMW': 0, 'TIC2': 0, 'naRing': 0, 'MPC3': 0}
+        
+        if mol is not None:
+            try:
+                calc = Calculator([
+                    descriptors.Weight,
+                    descriptors.InformationContent,
+                    descriptors.RingCount,
+                    descriptors.PathCount
+                ])
+                
+                mordred_result = calc(mol)
+                desc_dict = dict(zip(calc.descriptors, mordred_result))
+                
+                # Extract specific descriptors
+                amw = next((v for k, v in desc_dict.items() if 'AMW' in str(k)), 0)
+                tic2 = next((v for k, v in desc_dict.items() if 'TIC2' in str(k)), 0)
+                naring = next((v for k, v in desc_dict.items() if 'naRing' in str(k)), 0)
+                mpc3 = next((v for k, v in desc_dict.items() if 'MPC3' in str(k)), 0)
+                
+                results['AMW'] = float(amw) if amw is not None and not isinstance(amw, type(None)) else 0
+                results['TIC2'] = float(tic2) if tic2 is not None and not isinstance(tic2, type(None)) else 0
+                results['naRing'] = float(naring) if naring is not None and not isinstance(naring, type(None)) else 0
+                results['MPC3'] = float(mpc3) if mpc3 is not None and not isinstance(mpc3, type(None)) else 0
+                
+            except Exception as e:
+                results.update(mordred_defaults)
+        else:
+            results.update(mordred_defaults)
+        
+        # Compute specific MACCS fingerprint features
+        maccs_defaults = {
+            'MACCS_Key130': 0, 'MACCS_Key142': 0, 'MACCS_Key066': 0, 'MACCS_Key153': 0
+        }
+        
+        if mol is not None:
+            try:
+                fp = MACCSkeys.GenMACCSKeys(mol)
+                fingerprint = [int(x) for x in fp.ToBitString()]
+                
+                # Extract specific MACCS keys (convert to 0-based indexing)
+                if len(fingerprint) >= 167:
+                    results['MACCS_Key130'] = fingerprint[129] if 129 < len(fingerprint) else 0  # Fixed: 130-1
+                    results['MACCS_Key142'] = fingerprint[141] if 141 < len(fingerprint) else 0  # Fixed: 142-1
+                    results['MACCS_Key066'] = fingerprint[65] if 65 < len(fingerprint) else 0   # Fixed: 66-1
+                    results['MACCS_Key153'] = fingerprint[152] if 152 < len(fingerprint) else 0  # Fixed: 153-1
+                else:
+                    results.update(maccs_defaults)
+                    
+            except Exception as e:
+                results.update(maccs_defaults)
+        else:
+            results.update(maccs_defaults)
+        
+        # Compute specific TopologicalTorsion fingerprint features
+        torsion_defaults = {
+            'TopologicalTorsion_Bit0512': 0, 'TopologicalTorsion_Bit1296': 0
+        }
+        
+        if mol is not None:
+            try:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore")
+                    fp = rdMolDescriptors.GetHashedTopologicalTorsionFingerprintAsBitVect(mol, nBits=2048)
+                    fingerprint = [int(x) for x in fp.ToBitString()]
+                    
+                    # Extract specific TopologicalTorsion bits
+                    if len(fingerprint) >= 2048:
+                        results['TopologicalTorsion_Bit0512'] = fingerprint[512] if 512 < len(fingerprint) else 0
+                        results['TopologicalTorsion_Bit1296'] = fingerprint[1296] if 1296 < len(fingerprint) else 0
+                    else:
+                        results.update(torsion_defaults)
+                    
+            except Exception as e:
+                results.update(torsion_defaults)
+        else:
+            results.update(torsion_defaults)
+
+        # ✨ NEW: Compute specific AtomPair fingerprint features
+        atom_pair_defaults = {
+            'AtomPair_B512_Bit0138': 0, 
+            'AtomPair_B512_Bit0448': 0, 
+            'AtomPair_B512_Bit0408': 0
+        }
+
+        if mol is not None:
+            try:
+                fp = rdMolDescriptors.GetHashedAtomPairFingerprintAsBitVect(mol, nBits=512)
+                fingerprint = [int(x) for x in fp.ToBitString()]
+
+                # Extract specific AtomPair bits
+                if len(fingerprint) == 512:
+                    results['AtomPair_B512_Bit0138'] = fingerprint[138]
+                    results['AtomPair_B512_Bit0448'] = fingerprint[448]
+                    results['AtomPair_B512_Bit0408'] = fingerprint[408]
+                else:
+                    results.update(atom_pair_defaults)
+
+            except Exception as e:
+                results.update(atom_pair_defaults)
+        else:
+            results.update(atom_pair_defaults)
+        
+        return results
+        
+    except Exception as e:
+        print(f"Critical error for {smiles}: {e}")
+        return None
+
+def process_molecular_features_parallel(df, useless_cols, n_jobs=4):
+    """Process molecular features in parallel using joblib"""
+    if n_jobs == -1:
+        n_jobs = cpu_count()
+    
+    print(f"🔄 Using joblib with {n_jobs} jobs")
+    
+    smiles_list = df['SMILES'].tolist()
+    
+    # Process in parallel
+    results = Parallel(n_jobs=n_jobs, verbose=1)(
+        delayed(compute_molecular_features_for_smiles)(smiles, useless_cols) for smiles in smiles_list
+    )
+    
+    # Filter out None results
+    results = [r for r in results if r is not None]
+    
+    if not results:
+        print("⚠️ No valid molecular features computed")
+        return pd.DataFrame()
+    
+    result_df = pd.DataFrame(results)
+    result_df = result_df.replace([-np.inf, np.inf], np.nan)
+    
+    return result_df
+
+# =============================================================================
+# EMBEDDING AND CLUSTERING FUNCTIONS
+# =============================================================================
+
+
+
+def setup_molformer_paths(cfg):
+    """Setup model paths for MolFormer"""
+    print("📁 Setting up MolFormer model paths...")
+    os.system(f"mkdir -p ./ibm/MoLFormer-XL-both-10pct")
+    os.system(f"cp {cfg.MOLFORMER_PATH}/molformer-xl-both-10pct/* ./ibm/MoLFormer-XL-both-10pct/")
+
+def process_embeddings_one_by_one(smiles_list, model, tokenizer, model_type='chemberta', default_dim=384):
+    """
+    Process SMILES embeddings one by one with error handling
+    
+    Args:
+        smiles_list: List of SMILES strings
+        model: Transformer model
+        tokenizer: Tokenizer for the model
+        model_type: 'chemberta' or 'molformer' for correct default embedding dimension
+        default_dim: Default embedding dimension
+    """
+    all_embeddings = []
+    
+    # Set default embedding dimension based on model type
+    if model_type.lower() == 'chemberta':
+        default_embedding_dim = 384
+    elif model_type.lower() == 'molformer':
+        default_embedding_dim = 768
+    else:
+        default_embedding_dim = default_dim
+    
+    print(f"🔧 Using default embedding dimension: {default_embedding_dim} for model type: {model_type}")
+    
+    successful_embeddings = 0
+    failed_embeddings = 0
+    
+    for i, smiles in enumerate(tqdm(smiles_list, desc=f"Processing {model_type} embeddings")):
+        try:
+            # Tokenize single SMILES
+            inputs = tokenizer([smiles], padding=True, return_tensors="pt", truncation=True, max_length=512)
+            
+            # Get embedding
+            with torch.no_grad():
+                outputs = model(**inputs)
+                
+                # Handle different output formats
+                if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+                    embedding = outputs.pooler_output.squeeze(0)
+                elif hasattr(outputs, 'last_hidden_state'):
+                    # Use mean pooling if no pooler output
+                    embedding = outputs.last_hidden_state.mean(dim=1).squeeze(0)
+                else:
+                    raise ValueError("Cannot extract embedding from model output")
+                
+                # Verify embedding dimension matches expected
+                if embedding.shape[0] != default_embedding_dim:
+                    print(f"⚠️ Unexpected embedding dimension {embedding.shape[0]} vs {default_embedding_dim} for SMILES: {smiles}")
+                    # Pad or truncate if necessary
+                    if embedding.shape[0] < default_embedding_dim:
+                        padding = torch.zeros(default_embedding_dim - embedding.shape[0])
+                        embedding = torch.cat([embedding, padding])
+                    else:
+                        embedding = embedding[:default_embedding_dim]
+                
+                all_embeddings.append(embedding)
+                successful_embeddings += 1
+                
+        except Exception as e:
+            if i < 5:  # Only print first few errors
+                print(f"⚠️ Error processing SMILES '{smiles}' at index {i}: {e}")
+            
+            # Create zero vector of correct dimension
+            zero_embedding = torch.zeros(default_embedding_dim)
+            all_embeddings.append(zero_embedding)
+            failed_embeddings += 1
+    
+    print(f"📊 Embedding results: {successful_embeddings} successful, {failed_embeddings} failed")
+    
+    # Stack all embeddings
+    if all_embeddings:
+        final_embeddings = torch.stack(all_embeddings, dim=0)
+        print(f"✅ Final embeddings shape: {final_embeddings.shape}")
+        return final_embeddings
+    else:
+        print("❌ No embeddings generated")
+        return torch.zeros(len(smiles_list), default_embedding_dim)
+
+def perform_hdbscan_clustering(embeddings, min_cluster_size, min_samples, random_state=42):
+    """
+    Perform HDBSCAN clustering on embeddings
+    
+    Args:
+        embeddings: numpy array of embeddings
+        min_cluster_size: minimum cluster size for HDBSCAN
+        min_samples: minimum samples parameter for HDBSCAN
+        random_state: random state for reproducibility
+    
+    Returns:
+        cluster_labels: array of cluster labels (-1 for noise points)
+        clusterer: fitted HDBSCAN object
+    """
+    print(f"🎯 Performing HDBSCAN clustering (min_cluster_size={min_cluster_size}, min_samples={min_samples})...")
+    
+    try:
+        # Initialize HDBSCAN
+        clusterer = hdbscan.HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            cluster_selection_epsilon=0.0,
+            prediction_data=True
+        )
+        
+        # Fit and predict
+        cluster_labels = clusterer.fit_predict(embeddings)
+        
+        # Get clustering statistics
+        unique_labels = np.unique(cluster_labels)
+        n_clusters = len(unique_labels) - (1 if -1 in unique_labels else 0)  # -1 is noise
+        n_noise = np.sum(cluster_labels == -1)
+        
+        print(f"✅ HDBSCAN completed: {n_clusters} clusters, {n_noise} noise points")
+        
+        # Replace -1 (noise) with a specific cluster number (use max cluster + 1)
+        if len(cluster_labels) > 0:
+            max_cluster = np.max(cluster_labels[cluster_labels != -1]) if np.any(cluster_labels != -1) else -1
+            noise_cluster_id = max_cluster + 1 if max_cluster >= 0 else 0
+            cluster_labels[cluster_labels == -1] = noise_cluster_id
+            print(f"🔧 Noise points reassigned to cluster {noise_cluster_id}")
+        
+        return cluster_labels, clusterer
+        
+    except Exception as e:
+        print(f"❌ Error in HDBSCAN clustering: {e}")
+        # Return default cluster assignments (all points to cluster 0)
+        return np.zeros(len(embeddings), dtype=int), None
+
+def add_clustering_features_to_df(df, clustering_results):
+    """Add clustering features to dataframe"""
+    for embedding_type, results in clustering_results.items():
+        if results is not None:
+            feature_name = results['feature_name']
+            smiles_to_cluster = results['smiles_to_cluster']
+            
+            cluster_values = []
+            for smiles in df['SMILES']:
+                if smiles in smiles_to_cluster:
+                    cluster_values.append(smiles_to_cluster[smiles])
+                else:
+                    cluster_values.append(0)  # Default cluster for missing SMILES
+            
+            df[feature_name] = cluster_values
+            print(f"✅ Added clustering feature: {feature_name}")
+    
+    return df
+
+# =============================================================================
+# CLUSTERING GENERATION FUNCTIONS
+# =============================================================================
+
+
+
+def generate_clustering_features(all_smiles, cfg, mode='train', existing_clustering=None):
+    """Generate clustering features - either create new or use existing KMeans/HDBSCAN models"""
+    
+    if mode == 'train':
+        print("🔬 Generating clustering features for training data...")
+        clustering_results = {}
+        
+        # 1. ChemBERTa embeddings and clustering
+        print("\n🧪 Processing ChemBERTa embeddings...")
+        try:
+            chemberta_model = AutoModel.from_pretrained(cfg.CHEMBERTA_PATH, local_files_only=True, trust_remote_code=True)
+            chemberta_tokenizer = AutoTokenizer.from_pretrained(cfg.CHEMBERTA_PATH, trust_remote_code=True, local_files_only=True)
+            
+            # Import the function
+            #from embedding_clustering import process_embeddings_one_by_one, perform_hdbscan_clustering
+            
+            chemberta_embeddings = process_embeddings_one_by_one(all_smiles, chemberta_model, chemberta_tokenizer, model_type='chemberta')
+            print(f"✅ ChemBERTa embeddings shape: {chemberta_embeddings.shape}")
+            
+            if chemberta_embeddings.numel() > 0:  # Check if we have valid embeddings
+                embeddings_numpy = chemberta_embeddings.numpy()
+                
+                # Original KMeans clustering
+                print(f"🎯 Performing ChemBERTa KMeans clustering ({cfg.CHEMBERTA_CLUSTERS} clusters)...")
+                chemberta_kmeans = KMeans(n_clusters=cfg.CHEMBERTA_CLUSTERS, random_state=cfg.SEED, n_init=10)
+                chemberta_labels = chemberta_kmeans.fit_predict(embeddings_numpy)
+                
+                clustering_results['chemberta'] = {
+                    'smiles_to_cluster': dict(zip(all_smiles, chemberta_labels)),
+                    'kmeans_model': chemberta_kmeans,
+                    'embedding_model': None,  # Will be saved separately if needed
+                    'tokenizer': None,  # Will be saved separately if needed
+                    'n_clusters': cfg.CHEMBERTA_CLUSTERS,
+                    'feature_name': 'chemberta_cluster'
+                }
+                
+                print(f"✅ ChemBERTa KMeans clustering complete!")
+                
+                # HDBSCAN clustering with first parameter set
+                hdbscan_labels_1, hdbscan_model_1 = perform_hdbscan_clustering(
+                    embeddings_numpy, 
+                    min_cluster_size=cfg.HDBSCAN_MIN_CLUSTER_SIZE_1, 
+                    min_samples=cfg.HDBSCAN_MIN_SAMPLES_1,
+                    random_state=cfg.SEED
+                )
+                
+                clustering_results['chemberta_hdbscan_1'] = {
+                    'smiles_to_cluster': dict(zip(all_smiles, hdbscan_labels_1)),
+                    'hdbscan_model': hdbscan_model_1,
+                    'min_cluster_size': cfg.HDBSCAN_MIN_CLUSTER_SIZE_1,
+                    'min_samples': cfg.HDBSCAN_MIN_SAMPLES_1,
+                    'feature_name': 'chemberta_hdbscan_cluster_1'
+                }
+                
+                print(f"✅ ChemBERTa HDBSCAN clustering 1 complete!")
+                
+                # HDBSCAN clustering with second parameter set
+                hdbscan_labels_2, hdbscan_model_2 = perform_hdbscan_clustering(
+                    embeddings_numpy, 
+                    min_cluster_size=cfg.HDBSCAN_MIN_CLUSTER_SIZE_2, 
+                    min_samples=cfg.HDBSCAN_MIN_SAMPLES_2,
+                    random_state=cfg.SEED
+                )
+                
+                clustering_results['chemberta_hdbscan_2'] = {
+                    'smiles_to_cluster': dict(zip(all_smiles, hdbscan_labels_2)),
+                    'hdbscan_model': hdbscan_model_2,
+                    'min_cluster_size': cfg.HDBSCAN_MIN_CLUSTER_SIZE_2,
+                    'min_samples': cfg.HDBSCAN_MIN_SAMPLES_2,
+                    'feature_name': 'chemberta_hdbscan_cluster_2'
+                }
+                
+                print(f"✅ ChemBERTa HDBSCAN clustering 2 complete!")
+                
+            else:
+                print(f"❌ ChemBERTa: No valid embeddings generated")
+                clustering_results['chemberta'] = None
+                clustering_results['chemberta_hdbscan_1'] = None
+                clustering_results['chemberta_hdbscan_2'] = None
+            
+            # Clean up ChemBERTa model (keeping only clustering models)
+            del chemberta_model, chemberta_tokenizer, chemberta_embeddings
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+        except Exception as e:
+            print(f"❌ Error processing ChemBERTa: {e}")
+            clustering_results['chemberta'] = None
+            clustering_results['chemberta_hdbscan_1'] = None
+            clustering_results['chemberta_hdbscan_2'] = None
+        
+        # 2. MolFormer embeddings and clustering
+        print("\n🧬 Processing MolFormer embeddings...")
+        try:
+            #from embedding_clustering import setup_molformer_paths
+            setup_molformer_paths(cfg)
+            
+            molformer_model = AutoModel.from_pretrained('./ibm/MoLFormer-XL-both-10pct/', 
+                                                       deterministic_eval=True, 
+                                                       local_files_only=True,
+                                                       trust_remote_code=True)
+            molformer_tokenizer = AutoTokenizer.from_pretrained('./ibm/MoLFormer-XL-both-10pct/', 
+                                                               trust_remote_code=True,
+                                                               local_files_only=True)
+            
+            molformer_embeddings = process_embeddings_one_by_one(all_smiles, molformer_model, molformer_tokenizer, model_type='molformer')
+            print(f"✅ MolFormer embeddings shape: {molformer_embeddings.shape}")
+            
+            if molformer_embeddings.numel() > 0:
+                # MolFormer clustering
+                print(f"🎯 Performing MolFormer KMeans clustering ({cfg.MOLFORMER_CLUSTERS} clusters)...")
+                molformer_kmeans = KMeans(n_clusters=cfg.MOLFORMER_CLUSTERS, random_state=cfg.SEED, n_init=10)
+                molformer_labels = molformer_kmeans.fit_predict(molformer_embeddings.numpy())
+                
+                clustering_results['molformer'] = {
+                    'smiles_to_cluster': dict(zip(all_smiles, molformer_labels)),
+                    'kmeans_model': molformer_kmeans,
+                    'embedding_model': None,
+                    'tokenizer': None,
+                    'n_clusters': cfg.MOLFORMER_CLUSTERS,
+                    'feature_name': 'molformer_cluster'
+                }
+                
+                print(f"✅ MolFormer clustering complete!")
+            else:
+                print(f"❌ MolFormer: No valid embeddings generated")
+                clustering_results['molformer'] = None
+            
+            # Clean up MolFormer model
+            del molformer_model, molformer_tokenizer, molformer_embeddings
+            torch.cuda.empty_cache()
+            gc.collect()
+            os.system("rm -rf ./ibm")
+            
+        except Exception as e:
+            print(f"❌ Error processing MolFormer: {e}")
+            clustering_results['molformer'] = None
+        
+        return clustering_results
+    
+    else:  # mode == 'test'
+        print("🔬 Applying existing KMeans/HDBSCAN models to test data...")
+        return apply_clustering_to_test(all_smiles, cfg, existing_clustering)
+
+
+def apply_clustering_to_test(all_smiles, cfg, existing_clustering):
+    """Apply existing clustering models to test data"""
+    test_clustering_results = {}
+    
+    # Import required functions
+    #from embedding_clustering import process_embeddings_one_by_one, setup_molformer_paths
+    import hdbscan
+    
+    # 1. ChemBERTa test clustering
+    if existing_clustering.get('chemberta') is not None or \
+       existing_clustering.get('chemberta_hdbscan_1') is not None or \
+       existing_clustering.get('chemberta_hdbscan_2') is not None:
+        
+        print("\n🧪 Applying ChemBERTa clustering to test data...")
+        try:
+            chemberta_model = AutoModel.from_pretrained(cfg.CHEMBERTA_PATH, local_files_only=True, trust_remote_code=True)
+            chemberta_tokenizer = AutoTokenizer.from_pretrained(cfg.CHEMBERTA_PATH, trust_remote_code=True, local_files_only=True)
+            
+            # Generate embeddings for test SMILES
+            chemberta_embeddings = process_embeddings_one_by_one(all_smiles, chemberta_model, chemberta_tokenizer, model_type='chemberta')
+            print(f"✅ ChemBERTa test embeddings shape: {chemberta_embeddings.shape}")
+            
+            if chemberta_embeddings.numel() > 0:
+                embeddings_numpy = chemberta_embeddings.numpy()
+                
+                # Apply KMeans model if available
+                if existing_clustering.get('chemberta') is not None:
+                    chemberta_kmeans = existing_clustering['chemberta']['kmeans_model']
+                    chemberta_test_labels = chemberta_kmeans.predict(embeddings_numpy)
+                    
+                    test_clustering_results['chemberta'] = {
+                        'smiles_to_cluster': dict(zip(all_smiles, chemberta_test_labels)),
+                        'kmeans_model': chemberta_kmeans,
+                        'n_clusters': existing_clustering['chemberta']['n_clusters'],
+                        'feature_name': existing_clustering['chemberta']['feature_name']
+                    }
+                    
+                    print(f"✅ ChemBERTa KMeans test clustering applied!")
+                
+                # Apply HDBSCAN models
+                for hdbscan_key in ['chemberta_hdbscan_1', 'chemberta_hdbscan_2']:
+                    if existing_clustering.get(hdbscan_key) is not None:
+                        hdbscan_model = existing_clustering[hdbscan_key]['hdbscan_model']
+                        if hdbscan_model is not None:
+                            #try:
+                            # For HDBSCAN, we use approximate_predict for new data
+                            hdbscan_test_labels, _ = hdbscan.approximate_predict(hdbscan_model, embeddings_numpy)
+                            
+                            # Handle noise points (-1) same way as in training
+                            if len(hdbscan_test_labels) > 0:
+                                max_cluster = np.max(hdbscan_test_labels[hdbscan_test_labels != -1]) if np.any(hdbscan_test_labels != -1) else -1
+                                noise_cluster_id = max_cluster + 1 if max_cluster >= 0 else 0
+                                hdbscan_test_labels[hdbscan_test_labels == -1] = noise_cluster_id
+                            
+                            test_clustering_results[hdbscan_key] = {
+                                'smiles_to_cluster': dict(zip(all_smiles, hdbscan_test_labels)),
+                                'hdbscan_model': hdbscan_model,
+                                'min_cluster_size': existing_clustering[hdbscan_key]['min_cluster_size'],
+                                'min_samples': existing_clustering[hdbscan_key]['min_samples'],
+                                'feature_name': existing_clustering[hdbscan_key]['feature_name']
+                            }
+                            
+                            print(f"✅ {hdbscan_key} test clustering applied!")
+                            #except Exception as e:
+                            #    print(f"⚠️ Error applying {hdbscan_key}: {e}")
+                            #    test_clustering_results[hdbscan_key] = None
+            
+            # Clean up
+            del chemberta_model, chemberta_tokenizer, chemberta_embeddings
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+        except Exception as e:
+            print(f"⚠️ Error applying ChemBERTa clustering to test data: {e}")
+            test_clustering_results['chemberta'] = None
+            test_clustering_results['chemberta_hdbscan_1'] = None
+            test_clustering_results['chemberta_hdbscan_2'] = None
+    
+    # 2. MolFormer test clustering
+    if existing_clustering.get('molformer') is not None:
+        print("\n🧬 Applying MolFormer clustering to test data...")
+        try:
+            setup_molformer_paths(cfg)
+            
+            molformer_model = AutoModel.from_pretrained('./ibm/MoLFormer-XL-both-10pct/', 
+                                                       deterministic_eval=True, 
+                                                       local_files_only=True,
+                                                       trust_remote_code=True)
+            molformer_tokenizer = AutoTokenizer.from_pretrained('./ibm/MoLFormer-XL-both-10pct/', 
+                                                               trust_remote_code=True,
+                                                               local_files_only=True)
+            
+            # Generate embeddings for test SMILES
+            molformer_embeddings = process_embeddings_one_by_one(all_smiles, molformer_model, molformer_tokenizer, model_type='molformer')
+            print(f"✅ MolFormer test embeddings shape: {molformer_embeddings.shape}")
+            
+            if molformer_embeddings.numel() > 0:
+                # Apply trained KMeans model
+                molformer_kmeans = existing_clustering['molformer']['kmeans_model']
+                molformer_test_labels = molformer_kmeans.predict(molformer_embeddings.numpy())
+                
+                test_clustering_results['molformer'] = {
+                    'smiles_to_cluster': dict(zip(all_smiles, molformer_test_labels)),
+                    'kmeans_model': molformer_kmeans,
+                    'n_clusters': existing_clustering['molformer']['n_clusters'],
+                    'feature_name': existing_clustering['molformer']['feature_name']
+                }
+                
+                print(f"✅ MolFormer test clustering applied!")
+            else:
+                print(f"❌ MolFormer: No valid test embeddings generated")
+                test_clustering_results['molformer'] = None
+            
+            # Clean up
+            del molformer_model, molformer_tokenizer, molformer_embeddings
+            torch.cuda.empty_cache()
+            gc.collect()
+            os.system("rm -rf ./ibm")
+            
+        except Exception as e:
+            print(f"❌ Error applying MolFormer clustering to test: {e}")
+            test_clustering_results['molformer'] = None
+    else:
+        test_clustering_results['molformer'] = None
+    
+    return test_clustering_results
+
+# =============================================================================
+# FEATURE PROCESSING UTILITIES
+# =============================================================================
+
+
+
+
+def clean_features_and_compute_means(df, feature_columns):
+    """Clean features and compute means for training data"""
+    print("🧹 Cleaning features and computing means...")
+    
+    # Make a copy to avoid modifying original
+    df = df.copy()
+    
+    # Replace infinite values with NaN
+    for col in feature_columns:
+        if col in df.columns:
+            df[col] = df[col].replace([-np.inf, np.inf], np.nan)
+    
+    # Compute means for non-NaN values
+    feature_means = {}
+    for col in feature_columns:
+        if col in df.columns:
+            mean_val = df[col].mean()
+            feature_means[col] = mean_val if not np.isnan(mean_val) else 0
+        else:
+            feature_means[col] = 0
+    
+    print(f"✅ Computed means for {len(feature_means)} features")
+    return df, feature_means
+
+def apply_imputation_to_test(df, feature_columns, feature_means):
+    """Apply feature cleaning and imputation to test data"""
+    print("🧹 Cleaning and imputing test features...")
+    
+    # Make a copy to avoid modifying original
+    df = df.copy()
+    
+    # Replace infinite values with NaN
+    for col in feature_columns:
+        if col in df.columns:
+            df[col] = df[col].replace([-np.inf, np.inf], np.nan)
+    
+    # Replace NaN with training means
+    for col in feature_columns:
+        if col in df.columns and col in feature_means:
+            df[col] = df[col].fillna(feature_means[col])
+        elif col not in df.columns and col in feature_means:
+            # Add missing column with mean value
+            df[col] = feature_means[col]
+    
+    print(f"✅ Applied imputation to {len(feature_columns)} features")
+    return df
+
+def validate_features(df, expected_features, phase='train'):
+    """Validate that all expected features are present"""
+    missing_features = []
+    for feat in expected_features:
+        if feat not in df.columns:
+            missing_features.append(feat)
+    
+    if missing_features:
+        print(f"⚠️ Warning: {len(missing_features)} features missing in {phase} data:")
+        print(f"   {missing_features[:5]}{'...' if len(missing_features) > 5 else ''}")
+    else:
+        print(f"✅ All expected features present in {phase} data")
+    
+    return missing_features
+
+# =============================================================================
+# MAIN PIPELINE FUNCTIONS
+# =============================================================================
+
+
+
+def prepare_train(cfg):
+    """
+    Main function to prepare training features and save all necessary files
+    """
+    print("🚀 STARTING TRAINING FEATURE PREPARATION")
+    print("="*70)
+    
+    # Import required functions
+    #from config_constants import USELESS_COLS
+    #from data_loading import load_and_augment_train_data
+    #from clustering_generation import generate_clustering_features
+    #from embedding_clustering import add_clustering_features_to_df
+    #from molecular_features import process_molecular_features_parallel
+    #from feature_utils import clean_features_and_compute_means
+    
+    # Step 1: Load and augment training data
+    train = load_and_augment_train_data(cfg)
+    
+    # Step 2: Generate clustering features
+    all_smiles = train['SMILES'].tolist()
+    clustering_results = generate_clustering_features(all_smiles, cfg, mode='train')
+    
+    # Step 3: Add clustering features to train dataframe
+    train = add_clustering_features_to_df(train, clustering_results)
+    
+    # Step 4: Generate molecular features
+    print("🧬 Processing molecular features for train set...")
+    molecular_features = process_molecular_features_parallel(train, USELESS_COLS, n_jobs=4)
+    
+    # Step 5: Combine all features
+    if not molecular_features.empty:
+        train_complete = pd.concat([train, molecular_features], axis=1)
+    else:
+        print("⚠️ No molecular features generated, using only base features")
+        train_complete = train
+    
+    # Step 6: Identify feature columns
+    molecular_feature_names = molecular_features.columns.tolist() if not molecular_features.empty else []
+    clustering_feature_names = [results['feature_name'] for results in clustering_results.values() if results is not None]
+    all_computed_features = molecular_feature_names + clustering_feature_names
+    
+    # Step 7: Clean features and compute means
+    train_complete, feature_means = clean_features_and_compute_means(train_complete, all_computed_features)
+    
+    # Step 8: Generate metadata
+    feature_metadata = {
+        'molecular_features': molecular_feature_names,
+        'clustering_features': clustering_feature_names,
+        'all_computed_features': all_computed_features,
+        'original_columns': ['id', 'SMILES'] + cfg.TARGETS,
+        'useless_cols_excluded': USELESS_COLS,
+        'generation_config': {
+            'chemberta_clusters': cfg.CHEMBERTA_CLUSTERS,
+            'molformer_clusters': cfg.MOLFORMER_CLUSTERS,
+            'hdbscan_min_cluster_size_1': cfg.HDBSCAN_MIN_CLUSTER_SIZE_1,
+            'hdbscan_min_samples_1': cfg.HDBSCAN_MIN_SAMPLES_1,
+            'hdbscan_min_cluster_size_2': cfg.HDBSCAN_MIN_CLUSTER_SIZE_2,
+            'hdbscan_min_samples_2': cfg.HDBSCAN_MIN_SAMPLES_2,
+            'seed': cfg.SEED
+        }
+    }
+    
+    # Step 9: Save all files
+    print("\n💾 Saving training files...")
+    
+    # Create output directory if it doesn't exist
+    os.makedirs(cfg.OUTPUT_PATH, exist_ok=True)
+    
+    # Save complete training features
+    train_features_path = os.path.join(cfg.OUTPUT_PATH, cfg.TRAIN_FEATURES_FILE)
+    train_complete.to_pickle(train_features_path)
+    print(f"✅ Train features saved: {train_features_path} (Shape: {train_complete.shape})")
+    
+    # Save feature means for test imputation
+    means_path = os.path.join(cfg.OUTPUT_PATH, cfg.TRAIN_MEANS_FILE)
+    with open(means_path, 'wb') as f:
+        pickle.dump(feature_means, f)
+    print(f"✅ Feature means saved: {means_path}")
+    
+    # Save clustering information
+    clustering_path = os.path.join(cfg.OUTPUT_PATH, cfg.CLUSTERING_INFO_FILE)
+    with open(clustering_path, 'wb') as f:
+        pickle.dump(clustering_results, f)
+    print(f"✅ Clustering info saved: {clustering_path}")
+    
+    # Save metadata
+    metadata_path = os.path.join(cfg.OUTPUT_PATH, cfg.FEATURE_METADATA_FILE)
+    with open(metadata_path, 'wb') as f:
+        pickle.dump(feature_metadata, f)
+    print(f"✅ Metadata saved: {metadata_path}")
+    
+    # Final report
+    print(f"\n✨ TRAINING PREPARATION COMPLETE! ✨")
+    print(f"📊 Generated {len(all_computed_features)} features:")
+    print(f"   • Molecular features: {len(molecular_feature_names)}")
+    print(f"   • Clustering features: {len(clustering_feature_names)}")
+    if 'chemberta' in clustering_results and clustering_results['chemberta'] is not None:
+        print(f"     - ChemBERTa KMeans: 1 feature")
+    if 'chemberta_hdbscan_1' in clustering_results and clustering_results['chemberta_hdbscan_1'] is not None:
+        print(f"     - ChemBERTa HDBSCAN: 2 features")
+    if 'molformer' in clustering_results and clustering_results['molformer'] is not None:
+        print(f"     - MolFormer KMeans: 1 feature")
+    print(f"📁 Files saved to: {cfg.OUTPUT_PATH}")
+    
+    # Clean up memory
+    gc.collect()
+    
+    return train_complete, feature_means, clustering_results, feature_metadata
+
+def prepare_test(cfg):
+    """
+    Main function to prepare test features using saved training information
+    """
+    print("🚀 STARTING TEST FEATURE PREPARATION")
+    print("="*70)
+    
+    # Import required functions
+    #from config_constants import USELESS_COLS
+    #from data_loading import load_test_data
+    #from clustering_generation import generate_clustering_features
+    #from embedding_clustering import add_clustering_features_to_df
+    #from molecular_features import process_molecular_features_parallel
+    #from feature_utils import apply_imputation_to_test, validate_features
+    
+    # Step 1: Load required files from training
+    print("📂 Loading training preparation files...")
+    
+    # Load feature means
+    means_path = os.path.join(cfg.INPUT_PATH, cfg.TRAIN_MEANS_FILE)
+    try:
+        with open(means_path, 'rb') as f:
+            feature_means = pickle.load(f)
+        print(f"✅ Loaded feature means: {len(feature_means)} features")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Training means file not found: {means_path}. Run prepare_train() first.")
+    
+    # Load clustering information
+    clustering_path = os.path.join(cfg.INPUT_PATH, cfg.CLUSTERING_INFO_FILE)
+    try:
+        with open(clustering_path, 'rb') as f:
+            clustering_results = pickle.load(f)
+        print(f"✅ Loaded clustering information")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Clustering file not found: {clustering_path}. Run prepare_train() first.")
+    
+    # Load metadata
+    metadata_path = os.path.join(cfg.INPUT_PATH, cfg.FEATURE_METADATA_FILE)
+    try:
+        with open(metadata_path, 'rb') as f:
+            feature_metadata = pickle.load(f)
+        print(f"✅ Loaded feature metadata")
+    except FileNotFoundError:
+        raise FileNotFoundError(f"Metadata file not found: {metadata_path}. Run prepare_train() first.")
+    
+    # Step 2: Load test data
+    test = load_test_data(cfg)
+    
+    # Step 3: Generate clustering features using existing KMeans/HDBSCAN models
+    all_smiles = test['SMILES'].tolist()
+    test_clustering_results = generate_clustering_features(all_smiles, cfg, mode='test', existing_clustering=clustering_results)
+    
+    # Step 4: Add clustering features using test results
+    test = add_clustering_features_to_df(test, test_clustering_results)
+    
+    # Step 5: Generate molecular features
+    print("🧬 Processing molecular features for test set...")
+    molecular_features = process_molecular_features_parallel(test, USELESS_COLS, n_jobs=4)
+    
+    # Step 6: Combine all features
+    if not molecular_features.empty:
+        test_complete = pd.concat([test, molecular_features], axis=1)
+    else:
+        print("⚠️ No molecular features generated, using only base features")
+        test_complete = test
+    
+    # Step 7: Apply cleaning and imputation
+    all_computed_features = feature_metadata['all_computed_features']
+    test_complete = apply_imputation_to_test(test_complete, all_computed_features, feature_means)
+    
+    # Step 8: Validate features
+    validate_features(test_complete, all_computed_features, phase='test')
+    
+    # Step 9: Save test features
+    print("\n💾 Saving test features...")
+    test_features_path = os.path.join(cfg.OUTPUT_PATH, cfg.TEST_FEATURES_FILE)
+    test_complete.to_pickle(test_features_path)
+    print(f"✅ Test features saved: {test_features_path} (Shape: {test_complete.shape})")
+    
+    # Final report
+    print(f"\n✨ TEST PREPARATION COMPLETE! ✨")
+    print(f"📊 Applied {len(all_computed_features)} features with training means imputation")
+    
+    # Clean up memory
+    gc.collect()
+    
+    return test_complete
+
+# =============================================================================
+# CONFIGURATION AND CONSTANTS
+# =============================================================================
+
+# Define features to exclude (constant, problematic, or highly correlated)
+USELESS_COLS = [    
+    # NaN data
+    'BCUT2D_MWHI', 'BCUT2D_MWLOW', 'BCUT2D_CHGHI', 'BCUT2D_CHGLO',
+    'BCUT2D_LOGPHI', 'BCUT2D_LOGPLOW', 'BCUT2D_MRHI', 'BCUT2D_MRLOW',
+    
+    # Constant data
+    'NumRadicalElectrons', 'SMR_VSA8', 'SlogP_VSA9', 'fr_barbitur',
+    'fr_benzodiazepine', 'fr_dihydropyridine', 'fr_epoxide', 'fr_isothiocyan',
+    'fr_lactam', 'fr_nitroso', 'fr_prisulfonamd', 'fr_thiocyan',
+    
+    # High correlated data >0.95
+    'MaxEStateIndex', 'HeavyAtomMolWt', 'ExactMolWt', 'NumValenceElectrons',
+    'Chi0', 'Chi0n', 'Chi0v', 'Chi1', 'Chi1n', 'Chi1v', 'Chi2n', 'Kappa1',
+    'LabuteASA', 'HeavyAtomCount', 'MolMR', 'Chi3n', 'BertzCT', 'Chi2v',
+    'Chi4n', 'HallKierAlpha', 'Chi3v', 'Chi4v', 'MinAbsPartialCharge',
+    'MinPartialCharge', 'MaxAbsPartialCharge', 'FpDensityMorgan2',
+    'FpDensityMorgan3', 'Phi', 'Kappa3', 'fr_nitrile', 'SlogP_VSA6',
+    'NumAromaticCarbocycles', 'NumAromaticRings', 'fr_benzene', 'VSA_EState6',
+    'NOCount', 'fr_C_O', 'fr_C_O_noCOO', 'NumHDonors', 'fr_amide',
+    'fr_Nhpyrrole', 'fr_phenol', 'fr_phenol_noOrthoHbond', 'fr_COO2',
+    'fr_halogen', 'fr_diazo', 'fr_nitro_arom', 'fr_phos_ester'
+]
+
+# Default embedding dimensions
+CHEMBERTA_DIM = 384
+MOLFORMER_DIM = 768
+
+class FeaturePrepConfig:
+    """Configuration class for feature preparation"""
+    def __init__(self):
+        # Paths
+        self.PATH = '/kaggle/input/neurips-open-polymer-prediction-2025/'
+        self.OUTPUT_PATH = '/kaggle/working/'
+        self.INPUT_PATH = '/kaggle/input/neurips-preparedataset'
+        self.CHEMBERTA_PATH = '/kaggle/input/c/transformers/default/1/ChemBERTa-77M-MLM'
+        self.MOLFORMER_PATH = '/kaggle/input/download-molformer'
+        
+        # Files
+        self.TRAIN_FEATURES_FILE = 'train.pkl'
+        self.TEST_FEATURES_FILE = 'test.pkl'
+        self.TRAIN_MEANS_FILE = 'feature_means.pkl'
+        self.CLUSTERING_INFO_FILE = 'clustering_info.pkl'
+        self.FEATURE_METADATA_FILE = 'feature_metadata.pkl'
+        
+        # Model parameters
+        self.CHEMBERTA_CLUSTERS = 20
+        self.MOLFORMER_CLUSTERS = 20
+        self.HDBSCAN_MIN_CLUSTER_SIZE_1 = 25
+        self.HDBSCAN_MIN_SAMPLES_1 = 25
+        self.HDBSCAN_MIN_CLUSTER_SIZE_2 = 30
+        self.HDBSCAN_MIN_SAMPLES_2 = 3
+        
+        # Other
+        self.SEED = 42
+        self.TARGETS = ['Tg', 'Tc', 'Rg', 'FFV', 'Density']
+
+cfg = FeaturePrepConfig()
+#train = prepare_train(cfg)
+test = prepare_test(cfg)
+
+🚀 STARTING TEST FEATURE PREPARATION
+======================================================================
+📂 Loading training preparation files...
+✅ Loaded feature means: 177 features
+✅ Loaded clustering information
+✅ Loaded feature metadata
+📂 Loading test data...
+🔬 Applying existing KMeans/HDBSCAN models to test data...
+
+🧪 Applying ChemBERTa clustering to test data...
+
+2025-07-08 20:59:16.450494: E external/local_xla/xla/stream_executor/cuda/cuda_fft.cc:477] Unable to register cuFFT factory: Attempting to register factory for plugin cuFFT when one has already been registered
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+E0000 00:00:1752008356.681275      13 cuda_dnn.cc:8310] Unable to register cuDNN factory: Attempting to register factory for plugin cuDNN when one has already been registered
+E0000 00:00:1752008356.755525      13 cuda_blas.cc:1418] Unable to register cuBLAS factory: Attempting to register factory for plugin cuBLAS when one has already been registered
+
+🔧 Using default embedding dimension: 384 for model type: chemberta
+
+Processing chemberta embeddings: 100%
+ 3/3 [00:00<00:00,  4.08it/s]
+
+📊 Embedding results: 3 successful, 0 failed
+✅ Final embeddings shape: torch.Size([3, 384])
+✅ ChemBERTa test embeddings shape: torch.Size([3, 384])
+✅ ChemBERTa KMeans test clustering applied!
+✅ chemberta_hdbscan_1 test clustering applied!
+✅ chemberta_hdbscan_2 test clustering applied!
+
+🧬 Applying MolFormer clustering to test data...
+📁 Setting up MolFormer model paths...
+🔧 Using default embedding dimension: 768 for model type: molformer
+
+Processing molformer embeddings: 100%
+ 3/3 [00:00<00:00,  8.14it/s]
+
+📊 Embedding results: 3 successful, 0 failed
+✅ Final embeddings shape: torch.Size([3, 768])
+✅ MolFormer test embeddings shape: torch.Size([3, 768])
+✅ MolFormer test clustering applied!
+✅ Added clustering feature: chemberta_cluster
+✅ Added clustering feature: chemberta_hdbscan_cluster_1
+✅ Added clustering feature: chemberta_hdbscan_cluster_2
+✅ Added clustering feature: molformer_cluster
+🧬 Processing molecular features for test set...
+🔄 Using joblib with 4 jobs
+
+[Parallel(n_jobs=4)]: Using backend LokyBackend with 4 concurrent workers.
+[20:59:41] DEPRECATION WARNING: please use TopologicalTorsionGenerator
+[20:59:41] DEPRECATION WARNING: please use AtomPairGenerator
+[20:59:42] DEPRECATION WARNING: please use TopologicalTorsionGenerator
+[20:59:42] DEPRECATION WARNING: please use AtomPairGenerator
+[20:59:42] DEPRECATION WARNING: please use TopologicalTorsionGenerator
+[20:59:42] DEPRECATION WARNING: please use AtomPairGenerator
+[Parallel(n_jobs=4)]: Done   3 out of   3 | elapsed:    2.1s finished
+
+🧹 Cleaning and imputing test features...
+✅ Applied imputation to 177 features
+✅ All expected features present in test data
+
+💾 Saving test features...
+✅ Test features saved: /kaggle/working/test.pkl (Shape: (3, 179))
+
+✨ TEST PREPARATION COMPLETE! ✨
+📊 Applied 177 features with training means imputation
+
+ 
+
+train = pd.read_pickle('/kaggle/input/neurips-preparedataset/train.pkl')
+train.head()
+
+	id 	SMILES 	Tg 	FFV 	Tc 	Density 	Rg 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	... 	MPC3 	MACCS_Key130 	MACCS_Key142 	MACCS_Key066 	MACCS_Key153 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408
+0 	87817.0 	*CC(*)c1ccccc1C(=O)OCCCCCC 	NaN 	0.374645 	0.205667 	0.932 	NaN 	12 	28 	47 	... 	28.0 	1 	0 	0 	0 	0 	0 	0 	1 	0
+1 	106919.0 	*Nc1ccc([C@H](CCC)c2ccc(C3(c4ccc([C@@H](CCC)c5... 	NaN 	0.370410 	NaN 	NaN 	NaN 	4 	19 	34 	... 	95.0 	1 	1 	0 	0 	0 	0 	1 	1 	0
+2 	388772.0 	*Oc1ccc(S(=O)(=O)c2ccc(Oc3ccc(C4(c5ccc(Oc6ccc(... 	NaN 	0.378860 	NaN 	NaN 	NaN 	10 	24 	39 	... 	162.0 	1 	0 	0 	1 	1 	0 	1 	1 	1
+3 	519416.0 	*Nc1ccc(-c2c(-c3ccc(C)cc3)c(-c3ccc(C)cc3)c(N*)... 	NaN 	0.387324 	NaN 	NaN 	NaN 	4 	19 	34 	... 	98.0 	0 	1 	0 	0 	0 	0 	0 	1 	0
+4 	539187.0 	*Oc1ccc(OC(=O)c2cc(OCCCCCCCCCOCC3CCCN3c3ccc([N... 	NaN 	0.355470 	NaN 	NaN 	NaN 	10 	24 	39 	... 	126.0 	1 	0 	0 	1 	0 	0 	1 	1 	1
+
+5 rows × 184 columns
+
+test = pd.read_pickle('/kaggle/working/test.pkl')
+test['Ipc']=np.log10(test['Ipc'])
+test['Ipc']=test['Ipc'].astype(np.float32)
+for col in test.columns[2:]:
+    test[col]=test[col].replace(np.inf,np.nan).replace(-np.inf,np.nan).fillna(train[col].mean())
+    test[col]=test[col].clip(train[col].min(),train[col].max())
+test.head()
+
+	id 	SMILES 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	molformer_cluster 	MaxAbsEStateIndex 	MinAbsEStateIndex 	MinEStateIndex 	qed 	... 	MPC3 	MACCS_Key130 	MACCS_Key142 	MACCS_Key066 	MACCS_Key153 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408
+0 	1109053969 	*Oc1ccc(C=NN=Cc2ccc(Oc3ccc(C(c4ccc(*)cc4)(C(F)... 	10 	24 	39 	15 	14.296609 	0.084660 	-5.631140 	0.133192 	... 	83.0 	0 	0 	0 	1 	1 	0 	0 	1 	1
+1 	1422188626 	*Oc1ccc(C(C)(C)c2ccc(Oc3ccc(C(=O)c4cccc(C(=O)c... 	10 	24 	39 	15 	13.208391 	0.079396 	-0.162743 	0.195542 	... 	84.0 	0 	0 	0 	1 	1 	0 	0 	1 	0
+2 	2032016830 	*c1cccc(OCCCCCCCCOc2cccc(N3C(=O)c4ccc(-c5cccc6... 	11 	16 	18 	13 	13.556487 	0.203889 	-0.654083 	0.137097 	... 	100.0 	1 	0 	0 	1 	1 	0 	0 	1 	1
+
+3 rows × 179 columns
+
+model = TabularPredictor.load('/kaggle/input/neurips-train-autogluon-tg3/model/')
+pred = model.predict(test) #(model_Tg.predict(test)+model_TgKm.predict(test))/2
+test['Tg']=pred.values
+test.head()
+
+Found 1 mismatches between original and current metadata:
+	INFO: AutoGluon Python micro version mismatch (original=3.11.13, current=3.11.11)
+INFO:sklearnex: sklearn.neighbors.KNeighborsRegressor.predict: running accelerated version on CPU
+INFO:sklearnex: sklearn.neighbors.KNeighborsRegressor.predict: running accelerated version on CPU
+
+	id 	SMILES 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	molformer_cluster 	MaxAbsEStateIndex 	MinAbsEStateIndex 	MinEStateIndex 	qed 	... 	MACCS_Key130 	MACCS_Key142 	MACCS_Key066 	MACCS_Key153 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408 	Tg
+0 	1109053969 	*Oc1ccc(C=NN=Cc2ccc(Oc3ccc(C(c4ccc(*)cc4)(C(F)(F)F)C(F)(F)F)cc3)cc2)cc1 	10 	24 	39 	15 	14.296609 	0.084660 	-5.631140 	0.133192 	... 	0 	0 	0 	1 	1 	0 	0 	1 	1 	153.522400
+1 	1422188626 	*Oc1ccc(C(C)(C)c2ccc(Oc3ccc(C(=O)c4cccc(C(=O)c5ccc(*)cc5)c4)cc3)cc2)cc1 	10 	24 	39 	15 	13.208391 	0.079396 	-0.162743 	0.195542 	... 	0 	0 	0 	1 	1 	0 	0 	1 	0 	164.680038
+2 	2032016830 	*c1cccc(OCCCCCCCCOc2cccc(N3C(=O)c4ccc(-c5cccc6c5C(=O)N(*)C6=O)cc4C3=O)c2)c1 	11 	16 	18 	13 	13.556487 	0.203889 	-0.654083 	0.137097 	... 	1 	0 	0 	1 	1 	0 	0 	1 	1 	107.877441
+
+3 rows × 180 columns
+
+model = TabularPredictor.load('/kaggle/input/neurips-train-autogluon-tg3/model/')
+pred = model.predict(test)
+test['Tg']=pred.values
+test.head()
+
+Found 1 mismatches between original and current metadata:
+	INFO: AutoGluon Python micro version mismatch (original=3.11.13, current=3.11.11)
+INFO:sklearnex: sklearn.neighbors.KNeighborsRegressor.predict: running accelerated version on CPU
+INFO:sklearnex: sklearn.neighbors.KNeighborsRegressor.predict: running accelerated version on CPU
+
+	id 	SMILES 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	molformer_cluster 	MaxAbsEStateIndex 	MinAbsEStateIndex 	MinEStateIndex 	qed 	... 	MACCS_Key130 	MACCS_Key142 	MACCS_Key066 	MACCS_Key153 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408 	Tg
+0 	1109053969 	*Oc1ccc(C=NN=Cc2ccc(Oc3ccc(C(c4ccc(*)cc4)(C(F)(F)F)C(F)(F)F)cc3)cc2)cc1 	10 	24 	39 	15 	14.296609 	0.084660 	-5.631140 	0.133192 	... 	0 	0 	0 	1 	1 	0 	0 	1 	1 	153.522400
+1 	1422188626 	*Oc1ccc(C(C)(C)c2ccc(Oc3ccc(C(=O)c4cccc(C(=O)c5ccc(*)cc5)c4)cc3)cc2)cc1 	10 	24 	39 	15 	13.208391 	0.079396 	-0.162743 	0.195542 	... 	0 	0 	0 	1 	1 	0 	0 	1 	0 	164.680038
+2 	2032016830 	*c1cccc(OCCCCCCCCOc2cccc(N3C(=O)c4ccc(-c5cccc6c5C(=O)N(*)C6=O)cc4C3=O)c2)c1 	11 	16 	18 	13 	13.556487 	0.203889 	-0.654083 	0.137097 	... 	1 	0 	0 	1 	1 	0 	0 	1 	1 	107.877441
+
+3 rows × 180 columns
+
+model = TabularPredictor.load('/kaggle/input/neurips-train-autogluon-rg3/model/')
+pred = model.predict(test)
+test['Rg']=pred.values
+test.head()
+
+Found 1 mismatches between original and current metadata:
+	INFO: AutoGluon Python micro version mismatch (original=3.11.13, current=3.11.11)
+
+	id 	SMILES 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	molformer_cluster 	MaxAbsEStateIndex 	MinAbsEStateIndex 	MinEStateIndex 	qed 	... 	MACCS_Key142 	MACCS_Key066 	MACCS_Key153 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408 	Tg 	Rg
+0 	1109053969 	*Oc1ccc(C=NN=Cc2ccc(Oc3ccc(C(c4ccc(*)cc4)(C(F)(F)F)C(F)(F)F)cc3)cc2)cc1 	10 	24 	39 	15 	14.296609 	0.084660 	-5.631140 	0.133192 	... 	0 	0 	1 	1 	0 	0 	1 	1 	153.522400 	22.067251
+1 	1422188626 	*Oc1ccc(C(C)(C)c2ccc(Oc3ccc(C(=O)c4cccc(C(=O)c5ccc(*)cc5)c4)cc3)cc2)cc1 	10 	24 	39 	15 	13.208391 	0.079396 	-0.162743 	0.195542 	... 	0 	0 	1 	1 	0 	0 	1 	0 	164.680038 	21.315556
+2 	2032016830 	*c1cccc(OCCCCCCCCOc2cccc(N3C(=O)c4ccc(-c5cccc6c5C(=O)N(*)C6=O)cc4C3=O)c2)c1 	11 	16 	18 	13 	13.556487 	0.203889 	-0.654083 	0.137097 	... 	0 	0 	1 	1 	0 	0 	1 	1 	107.877441 	21.778608
+
+3 rows × 181 columns
+
+model = TabularPredictor.load('/kaggle/input/neurips-train-autogluon-ffv3/model/')
+pred = model.predict(test)
+test['FFV']=pred.values
+test.head()
+
+Found 1 mismatches between original and current metadata:
+	INFO: AutoGluon Python micro version mismatch (original=3.11.13, current=3.11.11)
+
+	id 	SMILES 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	molformer_cluster 	MaxAbsEStateIndex 	MinAbsEStateIndex 	MinEStateIndex 	qed 	... 	MACCS_Key066 	MACCS_Key153 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408 	Tg 	Rg 	FFV
+0 	1109053969 	*Oc1ccc(C=NN=Cc2ccc(Oc3ccc(C(c4ccc(*)cc4)(C(F)(F)F)C(F)(F)F)cc3)cc2)cc1 	10 	24 	39 	15 	14.296609 	0.084660 	-5.631140 	0.133192 	... 	0 	1 	1 	0 	0 	1 	1 	153.522400 	22.067251 	0.373180
+1 	1422188626 	*Oc1ccc(C(C)(C)c2ccc(Oc3ccc(C(=O)c4cccc(C(=O)c5ccc(*)cc5)c4)cc3)cc2)cc1 	10 	24 	39 	15 	13.208391 	0.079396 	-0.162743 	0.195542 	... 	0 	1 	1 	0 	0 	1 	0 	164.680038 	21.315556 	0.377074
+2 	2032016830 	*c1cccc(OCCCCCCCCOc2cccc(N3C(=O)c4ccc(-c5cccc6c5C(=O)N(*)C6=O)cc4C3=O)c2)c1 	11 	16 	18 	13 	13.556487 	0.203889 	-0.654083 	0.137097 	... 	0 	1 	1 	0 	0 	1 	1 	107.877441 	21.778608 	0.350609
+
+3 rows × 182 columns
+
+model = TabularPredictor.load('/kaggle/input/neurips-train-autogluon-density3/model/')
+pred = model.predict(test)
+test['Density']=pred.values
+test.head()
+
+Found 1 mismatches between original and current metadata:
+	INFO: AutoGluon Python micro version mismatch (original=3.11.13, current=3.11.11)
+
+	id 	SMILES 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	molformer_cluster 	MaxAbsEStateIndex 	MinAbsEStateIndex 	MinEStateIndex 	qed 	... 	MACCS_Key153 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408 	Tg 	Rg 	FFV 	Density
+0 	1109053969 	*Oc1ccc(C=NN=Cc2ccc(Oc3ccc(C(c4ccc(*)cc4)(C(F)(F)F)C(F)(F)F)cc3)cc2)cc1 	10 	24 	39 	15 	14.296609 	0.084660 	-5.631140 	0.133192 	... 	1 	1 	0 	0 	1 	1 	153.522400 	22.067251 	0.373180 	1.154463
+1 	1422188626 	*Oc1ccc(C(C)(C)c2ccc(Oc3ccc(C(=O)c4cccc(C(=O)c5ccc(*)cc5)c4)cc3)cc2)cc1 	10 	24 	39 	15 	13.208391 	0.079396 	-0.162743 	0.195542 	... 	1 	1 	0 	0 	1 	0 	164.680038 	21.315556 	0.377074 	1.089275
+2 	2032016830 	*c1cccc(OCCCCCCCCOc2cccc(N3C(=O)c4ccc(-c5cccc6c5C(=O)N(*)C6=O)cc4C3=O)c2)c1 	11 	16 	18 	13 	13.556487 	0.203889 	-0.654083 	0.137097 	... 	1 	1 	0 	0 	1 	1 	107.877441 	21.778608 	0.350609 	1.109268
+
+3 rows × 183 columns
+
+model = TabularPredictor.load('/kaggle/input/neurips-train-autogluon-tc3/model/')
+pred = model.predict(test)
+test['Tc']=pred.values
+test.head()
+
+Found 1 mismatches between original and current metadata:
+	INFO: AutoGluon Python micro version mismatch (original=3.11.13, current=3.11.11)
+
+	id 	SMILES 	chemberta_cluster 	chemberta_hdbscan_cluster_1 	chemberta_hdbscan_cluster_2 	molformer_cluster 	MaxAbsEStateIndex 	MinAbsEStateIndex 	MinEStateIndex 	qed 	... 	TopologicalTorsion_Bit0512 	TopologicalTorsion_Bit1296 	AtomPair_B512_Bit0138 	AtomPair_B512_Bit0448 	AtomPair_B512_Bit0408 	Tg 	Rg 	FFV 	Density 	Tc
+0 	1109053969 	*Oc1ccc(C=NN=Cc2ccc(Oc3ccc(C(c4ccc(*)cc4)(C(F)(F)F)C(F)(F)F)cc3)cc2)cc1 	10 	24 	39 	15 	14.296609 	0.084660 	-5.631140 	0.133192 	... 	1 	0 	0 	1 	1 	153.522400 	22.067251 	0.373180 	1.154463 	0.200953
+1 	1422188626 	*Oc1ccc(C(C)(C)c2ccc(Oc3ccc(C(=O)c4cccc(C(=O)c5ccc(*)cc5)c4)cc3)cc2)cc1 	10 	24 	39 	15 	13.208391 	0.079396 	-0.162743 	0.195542 	... 	1 	0 	0 	1 	0 	164.680038 	21.315556 	0.377074 	1.089275 	0.251981
+2 	2032016830 	*c1cccc(OCCCCCCCCOc2cccc(N3C(=O)c4ccc(-c5cccc6c5C(=O)N(*)C6=O)cc4C3=O)c2)c1 	11 	16 	18 	13 	13.556487 	0.203889 	-0.654083 	0.137097 	... 	1 	0 	0 	1 	1 	107.877441 	21.778608 	0.350609 	1.109268 	0.251326
+
+3 rows × 184 columns
+
+train=pd.read_pickle('/kaggle/input/prepare-features-km/train_features_complete.pkl')
+for t in ['Tg','Rg','FFV','Density','Tc']:
+    for s in train[train[t].notnull()]['SMILES']:
+        if s in test['SMILES'].tolist():
+            test.loc[test['SMILES']==s, t] = train[train['SMILES']==s][t].values[0]
+
+test[['id'] + ['Tg','Rg','FFV','Density','Tc']].to_csv('submission.csv', index=False)
+
+!head 'submission.csv'
+
+id,Tg,Rg,FFV,Density,Tc
+1109053969,153.5224,22.067251,0.3731804,1.1544632,0.2009535
+1422188626,164.68004,21.315556,0.3770743,1.0892749,0.25198135
+2032016830,107.87744,21.778608,0.350609,1.1092677,0.25132617
+
+huggingface/tokenizers: The current process just got forked, after parallelism has already been used. Disabling parallelism to avoid deadlocks...
+To disable this warning, you can either:
+	- Avoid using tokenizers before the fork if possible
+	- Explicitly set the environment variable TOKENIZERS_PARALLELISM=(true | false)
