@@ -1,0 +1,21 @@
+numpy
+pandas
+matplotlib
+seaborn
+scikit-learn
+hdbscan
+pyarrow            # for parquet IO
+miceforest
+lightgbm
+xgboost
+autogluon.tabular
+
+# cheminformatics & descriptors
+rdkit-pypi
+mordred
+
+# embeddings
+torch
+transformers
+sentencepiece
+tqdm
